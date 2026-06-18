@@ -1,0 +1,85 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # The official flatassembler.net only negotiates a TLS configuration that the
+  # Windows TLS stack (schannel, used by both Invoke-WebRequest and curl.exe)
+  # rejects. A Linux runner's OpenSSL downloads it fine, so we fetch the
+  # official archive here and hand it to the Windows build via an artifact.
+  fetch-fasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download FASM 1.73.35 (official)
+        run: |
+          curl -fSL --tlsv1.2 -A 'Mozilla/5.0' \
+            -o fasm.zip 'https://flatassembler.net/fasmw17335.zip'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fasm-dist
+          path: fasm.zip
+
+  build:
+    needs: fetch-fasm
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: fasm-dist
+
+      - name: Unpack FASM
+        shell: pwsh
+        run: |
+          Expand-Archive -Path fasm.zip -DestinationPath fasm-dl -Force
+          if (Test-Path fasm-dl/FASM.EXE)                { $root = "$PWD/fasm-dl" }
+          elseif (Test-Path fasm-dl/fasmw17335/FASM.EXE) { $root = "$PWD/fasm-dl/fasmw17335" }
+          else { throw "FASM.EXE not found in archive" }
+          "FASMROOT=$root" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Assemble
+        shell: pwsh
+        env:
+          INCLUDE: ${{ env.FASMROOT }}\INCLUDE
+        run: |
+          $fasm = "$env:FASMROOT\FASM.EXE"
+          & $fasm -d WITH_ICON=1 timer-res.asm           timer-res.exe;           if ($LASTEXITCODE) { exit 1 }
+          & $fasm -d WITH_ICON=0 timer-res.asm           timer-res-noicon.exe;    if ($LASTEXITCODE) { exit 1 }
+          & $fasm                timer-res-test-tool.asm timer-res-test-tool.exe; if ($LASTEXITCODE) { exit 1 }
+          Get-Item timer-res*.exe | Format-Table Name, Length
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: timer-res-asm-binaries
+          path: |
+            timer-res.exe
+            timer-res-noicon.exe
+            timer-res-test-tool.exe
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: timer-res-asm-binaries
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          # only ship the user-facing app builds; the test tool is build-only
+          files: |
+            dist/timer-res.exe
+            dist/timer-res-noicon.exe

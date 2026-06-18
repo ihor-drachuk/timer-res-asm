@@ -1,0 +1,13 @@
+# build outputs
+*.exe
+*.obj
+
+# bundled FASM (downloaded locally / in CI, never committed)
+fasm/
+fasmw*.zip
+
+# screenshots / scratch
+*.png
+
+# keep the embedded icon
+!*.ico
