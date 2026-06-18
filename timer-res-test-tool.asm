@@ -6,13 +6,18 @@
 ; Win64 / FASM 1.73+. Pure ASCII.
 ;
 ; Usage:
-;   timer-res-test-tool                    same as `query`
-;   timer-res-test-tool query              print Min / Max / Current
-;   timer-res-test-tool set max|1ms|default|<int>
+;   timer-res-test-tool                    same as `--query`
+;   timer-res-test-tool --query            print Min / Max / Current
+;   timer-res-test-tool --set max|1ms|4ms|default|<int>
 ;                                    set timer resolution then print state
-;   timer-res-test-tool hold max|1ms|<int> <seconds>
+;   timer-res-test-tool --hold max|1ms|4ms|<int> --secs <seconds>
 ;                                    set, then loop printing Current once a
 ;                                    second for <seconds>, then release
+;   timer-res-test-tool --autostart on|off|status
+;   timer-res-test-tool --resume           re-apply the last persisted value
+;
+; `--set` persists the value under HKCU\Software\timer-res (default/release
+; clears it); `--resume` reads it back. Mirrors the GUI's persist/resume path.
 ;
 ; All ABI: Win64 fastcall, manual stack frames. No `proc` macros for our
 ; own helpers - Windows callbacks (none here) would need them.
@@ -64,6 +69,11 @@ start:
         call    StrEqI
         test    eax, eax
         jnz     .cmd_autostart
+        mov     rcx, [argv + 8]
+        mov     rdx, str_resume
+        call    StrEqI
+        test    eax, eax
+        jnz     .cmd_resume
         jmp     .usage
 
 .cmd_query:
@@ -80,25 +90,45 @@ start:
         je      .usage
         mov     ecx, eax
         call    DoSet
+        ; persist the applied value (0 = release -> deletes the stored value)
+        mov     ecx, [lastDesired]
+        call    StoreLastValue
+        call    DoQuery
+        call    PrintState
+        invoke  ExitProcess, 0
+
+.cmd_resume:
+        call    LoadLastValue
+        test    eax, eax
+        jz      .resume_q
+        mov     ecx, eax
+        call    DoSet
+.resume_q:
         call    DoQuery
         call    PrintState
         invoke  ExitProcess, 0
 
 .cmd_hold:
-        cmp     dword [argc], 4
+        ; --hold <v> --secs <n>  : need value at argv[2] and the token after --secs
+        cmp     dword [argc], 5
         jl      .usage
-        mov     rcx, [argv + 16]
+        mov     rcx, [argv + 16]               ; argv[2] = value
         call    ParseValueArg
         cmp     eax, -1
         je      .usage
         mov     [holdVal], eax
-        mov     rcx, [argv + 24]
+        call    FindSecsArg                     ; -> rax = ptr to <n>, or 0
+        test    rax, rax
+        jz      .usage
+        mov     rcx, rax
         call    ParseUInt
         cmp     eax, -1
         je      .usage
         mov     [holdSecs], eax
         mov     ecx, [holdVal]
         call    DoSet
+        mov     ecx, [lastDesired]
+        call    StoreLastValue
         mov     dword [holdI], 0
 .hold_loop:
         mov     eax, [holdI]
@@ -305,8 +335,16 @@ ParseValueArg:
         mov     rdx, str_1ms
         call    StrEqI
         test    eax, eax
-        jz      .try_def
+        jz      .try_4ms
         mov     eax, RES_DEFHI
+        jmp     .done
+.try_4ms:
+        mov     rcx, rbx
+        mov     rdx, str_4ms
+        call    StrEqI
+        test    eax, eax
+        jz      .try_def
+        mov     eax, RES_4MS
         jmp     .done
 .try_def:
         mov     rcx, rbx
@@ -322,6 +360,41 @@ ParseValueArg:
 .done:
         add     rsp, 32
         pop     rbx
+        leave
+        ret
+
+; --------------------------------------------------------------------------
+; FindSecsArg: scan argv[] for the "--secs" token and return the pointer to the
+; following argument in RAX (0 if --secs is absent or has no following token).
+; Preserves RBX/RSI.
+FindSecsArg:
+        push    rbp
+        mov     rbp, rsp
+        push    rsi
+        push    rbx
+        sub     rsp, 32
+        mov     esi, 1                          ; index, skip argv[0]
+.loop:
+        mov     eax, [argc]
+        dec     eax                             ; need a following token
+        cmp     esi, eax
+        jge     .none
+        mov     rcx, [argv + rsi*8]
+        mov     rdx, str_secs
+        call    StrEqI
+        test    eax, eax
+        jnz     .hit
+        inc     esi
+        jmp     .loop
+.hit:
+        mov     rax, [argv + rsi*8 + 8]         ; argv[index+1]
+        jmp     .done
+.none:
+        xor     eax, eax
+.done:
+        add     rsp, 32
+        pop     rbx
+        pop     rsi
         leave
         ret
 
@@ -436,10 +509,10 @@ section '.data' data readable writeable
   fmt_ms       db '%u.%04u ms', 0
   fmt_state    db 'min=%s  max=%s  cur=%s  (lastDesired=%u)', 0
   msg_no_backend db 'ntdll NtQuery/NtSetTimerResolution not resolvable', 0
-  msg_usage    db 'usage: timer-res-test-tool [query | set <v> | hold <v> <secs> | autostart on|off|status]', 13, 10, \
-                  '       v ::= max | 1ms | default | <100ns int>', 13, 10, \
-                  'note: timer resolution is per-process; `set` only holds while this', 13, 10, \
-                  '      process runs. Use `hold` or the GUI to keep it applied.', 0
+  msg_usage    db 'usage: timer-res-test-tool [--query | --set <v> | --hold <v> --secs <n> | --autostart on|off|status | --resume]', 13, 10, \
+                  '       v ::= max | 1ms | 4ms | default | <100ns int>', 13, 10, \
+                  'note: timer resolution is per-process; `--set` only holds while this', 13, 10, \
+                  '      process runs. Use `--hold` or the GUI to keep it applied.', 0
   msg_released db '(released)', 0
   msg_as_on      db 'autostart: enabled', 0
   msg_as_off     db 'autostart: disabled', 0
@@ -447,19 +520,30 @@ section '.data' data readable writeable
   msg_as_cleared db 'autostart: removed', 0
   crlf_buf     db 13, 10
 
-  str_query    db 'query', 0
-  str_set      db 'set', 0
-  str_hold     db 'hold', 0
-  str_autostart db 'autostart', 0
+  str_query    db '--query', 0
+  str_set      db '--set', 0
+  str_hold     db '--hold', 0
+  str_autostart db '--autostart', 0
+  str_resume   db '--resume', 0
+  str_secs     db '--secs', 0
   str_on       db 'on', 0
   str_off      db 'off', 0
   str_max      db 'max', 0
   str_1ms      db '1ms', 0
+  str_4ms      db '4ms', 0
   str_default  db 'default', 0
 
-  ; autostart.inc shared wide strings
+  ; autostart.inc shared wide strings.
+  ; align 2: UTF-16 (du) strings MUST sit on an even address. RegCreateKeyExW
+  ; faults with ERROR_NOACCESS (998) on a misaligned lpSubKey, and FASM packs
+  ; data in source order with no padding - the odd-length db strings above would
+  ; otherwise leave these on an odd offset.
+  align 2
   run_key      du 'Software\Microsoft\Windows\CurrentVersion\Run', 0
   run_val      du 'TimerRes', 0
+  app_key      du 'Software\timer-res', 0
+  last_val     du 'LastValue', 0
+  run_suffix   du '" --min --resume', 0          ; appended to the quoted exe path
 
   ; --- mutable state (qwords / OUT params / buffers) ---
   ; align so qword pointers/handles sit on their natural 8-byte boundary after
@@ -475,6 +559,10 @@ section '.data' data readable writeable
   tCur         dd 0
   tActual      dd 0
   lastDesired  dd 0
+  storeVal     dd 0                        ; StoreLastValue: REG_DWORD source
+  loadBuf      dd 0                        ; LoadLastValue:  REG_DWORD dest
+  loadLen      dd 4                        ; RegQueryValueExW lpcbData (in/out)
+  regType      dd 0                        ; RegQueryValueExW lpType (out)
   lineLen      dd 0
   wrote        dd 0
   argc         dd 0
@@ -482,7 +570,7 @@ section '.data' data readable writeable
   holdSecs     dd 0
   holdI        dd 0
   align 16
-  exePath      rw MAX_PATH + 8
+  exePath      rw MAX_PATH + 20
   align 16
   argv         dq 32 dup (0)
   bufA         rb 32

@@ -26,8 +26,9 @@ A small, free clone of Lucas Hale's **TimerResolution.exe**. It shows the timer
 resolution Windows is currently using and lets you lock it to a finer value.
 
 The app (`timer-res.exe`) is a small window showing Min / Max / Current
-resolution, with **Maximum / 1 ms / Default** buttons, a system-tray icon, and a
-"Run at Windows startup" checkbox.
+resolution, with **Maximum / 1 ms / 4 ms / Default** buttons, a system-tray icon,
+and a "Run at Windows startup" checkbox. When started at logon it re-applies the
+resolution you last picked.
 
 ## Why timer resolution?
 
@@ -38,8 +39,8 @@ makes those problems disappear.
 
 On Windows 10 (2004+) and Windows 11 the timer resolution is **per-process** — it
 is released as soon as the program that set it exits. That's why the app stays in
-the tray, and why the command-line tool has a `hold` command (a one-shot `set`
-does not persist).
+the tray, and why the command-line tool has a `--hold` command (a one-shot
+`--set` does not persist).
 
 See also: [Microsoft — high-resolution timers](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)
 and the original [TimerResolution by Lucas Hale](https://vvvv.org/contribution/windows-system-timer-tool).
@@ -58,15 +59,16 @@ build it yourself? See [Build](#build).)
 
 - Windows 10 (version 2004 / May 2020) or newer, 64-bit.
 - **No admin rights, no install, no runtime** — just the `.exe`.
-- Footprint: the app is about **24 KB** (a 6.6 KB icon-less build is also provided).
+- Footprint: the app is about **25 KB** (an 8 KB icon-less build is also provided).
 
 The only change it makes outside its own process is the **optional** "Run at
 startup" registry entry, which is easy to undo (see [Removing autostart](#removing-autostart-manually)).
 
 ## Usage
 
-Click **Maximum** (finest the system supports, often 0.5 ms), **1 ms**, or
-**Default** (release). Tick **Run at Windows startup** to launch on logon. The X
+Click **Maximum** (finest the system supports, often 0.5 ms), **1 ms**, **4 ms**,
+or **Default** (release). Your choice is remembered, so when **Run at Windows
+startup** is ticked the app re-applies it automatically on the next logon. The X
 button minimizes to the tray; right-click the tray icon for **Show / Exit**.
 
 ## Build
@@ -79,13 +81,20 @@ You need [flat assembler (FASM) 1.73.35](https://flatassembler.net/download.php)
 
 This produces `timer-res.exe`, `timer-res-noicon.exe` (a smaller build with no
 embedded icon), and `timer-res-test-tool.exe` — a small console tool used to
-exercise the backend (`query` / `set` / `hold` / `autostart`); it is not part of
-the release.
+exercise the backend (`--query` / `--set` / `--hold` / `--autostart` /
+`--resume`); it is not part of the release.
 
 ## Removing autostart manually
 
 ```bat
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v TimerRes /f
+```
+
+The app also remembers your last choice under `HKCU\Software\timer-res` (so it can
+restore it at logon). To clear that too:
+
+```bat
+reg delete "HKCU\Software\timer-res" /f
 ```
 
 ## License

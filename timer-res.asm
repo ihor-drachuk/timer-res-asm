@@ -34,6 +34,7 @@ IDB_MAXIMUM  = 301
 IDB_DEFHI    = 302
 IDB_DEFAULT  = 303
 IDC_AUTORUN  = 304
+IDB_4MS      = 305
 
 TID_REFRESH  = 1
 IDM_SHOW     = 3001
@@ -57,6 +58,18 @@ start:
         je      .no_backend
         cmp     qword [pNtSet], 0
         je      .no_backend
+        ; scan the command line for --min / --resume (sets wantMin/wantResume)
+        call    ParseFlags
+        ; --resume: re-apply the last persisted value before the UI comes up so
+        ; the dialog's first refresh shows it and the timer keeps re-applying it.
+        cmp     dword [wantResume], 0
+        je      .no_resume
+        call    LoadLastValue
+        test    eax, eax
+        jz      .no_resume
+        mov     ecx, eax
+        call    DoSet
+.no_resume:
         invoke  GetModuleHandle, 0
         mov     [hInst], rax
         invoke  DialogBoxParam, rax, IDD_MAIN, 0, DialogProc, 0
@@ -86,6 +99,8 @@ proc DialogProc uses rbx, hdlg, umsg, wparam, lparam
         mov     eax, dword [umsg]
         cmp     eax, WM_INITDIALOG
         je      .init
+        cmp     eax, WM_WINDOWPOSCHANGING
+        je      .pos_changing
         cmp     eax, WM_COMMAND
         je      .cmd
         cmp     eax, WM_TIMER
@@ -98,6 +113,16 @@ proc DialogProc uses rbx, hdlg, umsg, wparam, lparam
         je      .close
         xor     eax, eax
         jmp     .done
+.pos_changing:
+        ; A modal DialogBox forces the window visible right after WM_INITDIALOG,
+        ; overriding the SW_HIDE we issue there. So while started with --min,
+        ; strip SWP_SHOWWINDOW from the pending WINDOWPOS so it never appears.
+        ; (One-shot: cleared on the first user-driven Show from the tray.)
+        cmp     dword [wantMin], 0
+        je      .done_zero
+        mov     rax, [lparam]                  ; -> WINDOWPOS
+        and     dword [rax + 32], not SWP_SHOWWINDOW  ; flags field (x64 offset 32)
+        jmp     .done_zero
 .init:
 if WITH_ICON
         ; set the window's title-bar / taskbar icon from our resource
@@ -149,6 +174,12 @@ end if
         mov     [nid.hIcon], rax
         invoke  lstrcpynW, nid.szTip, tray_tip, 64
         invoke  Shell_NotifyIconW, NIM_ADD, nid
+        ; launched with --min: start hidden (tray only). The modal dialog's own
+        ; message pump keeps running while hidden, so the tray stays live.
+        cmp     dword [wantMin], 0
+        je      .shown
+        invoke  ShowWindow, [hdlg], SW_HIDE
+.shown:
         mov     eax, 1
         jmp     .done
 .cmd:
@@ -160,6 +191,8 @@ end if
         je      .on_max
         cmp     eax, IDB_DEFHI
         je      .on_defhi
+        cmp     eax, IDB_4MS
+        je      .on_4ms
         cmp     eax, IDB_DEFAULT
         je      .on_default
         cmp     eax, IDC_AUTORUN
@@ -178,10 +211,18 @@ end if
         mov     ecx, RES_DEFHI
         call    DoSet
         jmp     .refresh_cur
+.on_4ms:
+        mov     ecx, RES_4MS
+        call    DoSet
+        jmp     .refresh_cur
 .on_default:
         mov     ecx, RES_RELEASE
         call    DoSet
 .refresh_cur:
+        ; persist the just-applied value (DoSet stored it in lastDesired);
+        ; RES_RELEASE (0) deletes the stored value -> --resume becomes a no-op.
+        mov     ecx, [lastDesired]
+        call    StoreLastValue
         call    DoQuery
         mov     ecx, [tCur]
         lea     rdx, [guiBuf]
@@ -220,6 +261,7 @@ end if
         invoke  DestroyMenu, [hCtxMenu]
         jmp     .done_zero
 .tray_show:
+        mov     dword [wantMin], 0             ; user wants it visible now; stop suppressing
         invoke  ShowWindow, [hdlg], SW_SHOW
         invoke  SetForegroundWindow, [hdlg]
         mov     eax, 1
@@ -254,6 +296,44 @@ end if
 endp
 
 ; --------------------------------------------------------------------------
+; ParseFlags - tokenize our command line and set [wantMin] / [wantResume] if a
+; whole argument equals "--min" / "--resume" (case-insensitive). Tokenized via
+; CommandLineToArgvW, so "--min" won't match "--minimize" or a path that
+; contains it. A `proc` for stack alignment; RBX/RSI/RDI preserved for the loop.
+proc ParseFlags uses rbx rsi rdi
+   local argcW:DWORD, pArgv:QWORD
+        invoke  GetCommandLineW
+        lea     rdx, [argcW]
+        invoke  CommandLineToArgvW, rax, rdx
+        test    rax, rax
+        jz      .done
+        mov     [pArgv], rax
+        mov     esi, 1                          ; index, skip argv[0] (exe path)
+.loop:
+        cmp     esi, [argcW]
+        jae     .free
+        mov     rax, [pArgv]
+        mov     rdi, [rax + rsi*8]              ; argv[esi]
+        invoke  lstrcmpiW, rdi, flag_min
+        test    eax, eax
+        jnz     .not_min
+        mov     dword [wantMin], 1
+        jmp     .next
+.not_min:
+        invoke  lstrcmpiW, rdi, flag_resume
+        test    eax, eax
+        jnz     .next
+        mov     dword [wantResume], 1
+.next:
+        inc     esi
+        jmp     .loop
+.free:
+        invoke  LocalFree, [pArgv]
+.done:
+        ret
+endp
+
+; --------------------------------------------------------------------------
 
 include 'autostart.inc'
 include 'backend.inc'
@@ -269,10 +349,20 @@ section '.data' data readable writeable
   fmt_ms       db '%u.%04u ms', 0
   _err_title   db 'Timer Resolution', 0
   err_backend  db 'ntdll NtQuery/NtSetTimerResolution unavailable.', 0
+  ; align 2: UTF-16 (du) strings MUST sit on an even address. RegCreateKeyExW
+  ; faults with ERROR_NOACCESS (998) on a misaligned lpSubKey, and FASM packs
+  ; data in source order with no padding - the odd-length db strings above would
+  ; otherwise leave these on an odd offset.
+  align 2
   menu_show    du 'Show', 0
   menu_exit    du 'Exit', 0
   run_key      du 'Software\Microsoft\Windows\CurrentVersion\Run', 0
   run_val      du 'TimerRes', 0
+  app_key      du 'Software\timer-res', 0
+  last_val     du 'LastValue', 0
+  flag_min     du '--min', 0
+  flag_resume  du '--resume', 0
+  run_suffix   du '" --min --resume', 0          ; appended to the quoted exe path
   tray_tip     du 'Timer Resolution', 0
 
   ; --- mutable state (qwords / OUT params / buffers) ---
@@ -292,9 +382,15 @@ section '.data' data readable writeable
   tCur         dd 0
   tActual      dd 0
   lastDesired  dd 0
+  storeVal     dd 0                        ; StoreLastValue: REG_DWORD source
+  loadBuf      dd 0                        ; LoadLastValue:  REG_DWORD dest
+  loadLen      dd 4                        ; RegQueryValueExW lpcbData (in/out)
+  regType      dd 0                        ; RegQueryValueExW lpType (out)
+  wantMin      dd 0                        ; cmdline: --min seen
+  wantResume   dd 0                        ; cmdline: --resume seen
   cursorPt     dd 0, 0                     ; POINT (x, y)
   align 16
-  exePath      rw MAX_PATH + 8             ; +8 for quote + ' -min' suffix
+  exePath      rw MAX_PATH + 20            ; +20 for quote + ' --min --resume' suffix
   align 16
   guiBuf       rb 64
 
@@ -315,7 +411,10 @@ section '.idata' import data readable writeable
          GetModuleHandle,   'GetModuleHandleA', \
          GetModuleFileNameW,'GetModuleFileNameW', \
          GetProcAddress,    'GetProcAddress', \
+         GetCommandLineW,   'GetCommandLineW', \
          lstrcpynW,         'lstrcpynW', \
+         lstrcmpiW,         'lstrcmpiW', \
+         LocalFree,         'LocalFree', \
          ExitProcess,       'ExitProcess'
 
   import user32, \
@@ -339,7 +438,8 @@ section '.idata' import data readable writeable
          wsprintf,          'wsprintfA'
 
   import shell32, \
-         Shell_NotifyIconW, 'Shell_NotifyIconW'
+         Shell_NotifyIconW,  'Shell_NotifyIconW', \
+         CommandLineToArgvW, 'CommandLineToArgvW'
 
   import advapi32, \
          RegOpenKeyExW,   'RegOpenKeyExW', \
@@ -395,11 +495,13 @@ end if
                100, 61, 90, 9, WS_VISIBLE
 
     dialogitem 'BUTTON', 'Maximum', IDB_MAXIMUM, \
-               7, 84, 50, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON
+               7, 84, 47, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON
     dialogitem 'BUTTON', '1 ms', IDB_DEFHI, \
-               65, 84, 50, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON
+               60, 84, 47, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON
+    dialogitem 'BUTTON', '4 ms', IDB_4MS, \
+               113, 84, 47, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON
     dialogitem 'BUTTON', 'Default', IDB_DEFAULT, \
-               123, 84, 50, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON + BS_DEFPUSHBUTTON
+               166, 84, 47, 14, WS_VISIBLE + WS_TABSTOP + BS_PUSHBUTTON + BS_DEFPUSHBUTTON
 
     dialogitem 'BUTTON', 'Run at Windows startup', IDC_AUTORUN, \
                7, 108, 160, 12, WS_VISIBLE + WS_TABSTOP + BS_AUTOCHECKBOX
