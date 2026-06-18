@@ -472,8 +472,12 @@ end if
   resource dialogs, \
            IDD_MAIN, LANG_ENGLISH + SUBLANG_DEFAULT, main_dialog
 
+  ; Combine styles with `or`, NOT `+`: the `dialog` macro already ORs DS_SETFONT
+  ; into the template, so a `+ DS_SETFONT` here would add the bit twice and carry
+  ; (0x40 + 0x40 = 0x80 = DS_MODALFRAME), corrupting the style and breaking dialog
+  ; creation. `or` is idempotent and is how Win32 styles are meant to be combined.
   dialog main_dialog, 'Set Timer Resolution', 0, 0, 220, 130, \
-         WS_CAPTION + WS_POPUP + WS_SYSMENU + WS_MINIMIZEBOX + DS_SETFONT, \
+         WS_CAPTION or WS_POPUP or WS_SYSMENU or WS_MINIMIZEBOX or DS_SETFONT or DS_CENTER, \
          0, 0, 'MS Shell Dlg', 8
 
     dialogitem 'BUTTON', 'Timer Resolution Range', -1, \
